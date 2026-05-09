@@ -3,6 +3,17 @@ Stock Sensei AI — FastAPI Backend
 Deploy on Railway (free tier) or any Python host.
 Serves the TGT model predictions to the Vercel frontend.
 """
+import shutil
+from pathlib import Path
+
+# One-time copy of base_model.pt to persistent volume
+_src = Path("base_model.pt")
+_dst = Path("/app/models/base_model.pt")
+if _src.exists() and not _dst.exists():
+    print("Copying base_model.pt to volume...")
+    _dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_src, _dst)
+    print("✓ base_model.pt copied to volume.")
 
 import os
 import json
