@@ -87,8 +87,8 @@ FINETUNE_CONFIG = dict(
     seq_len=60, pred_horizon=5,
     hidden_dim=128, num_gru_layers=2, num_heads=4, num_tf_layers=3,
     dropout=0.2, gcn_out_dim=64,
-    epochs=60, batch_size=16, lr=8e-5, weight_decay=1e-5,
-    patience=12, val_split=0.15, test_split=0.10,
+    epochs=20, batch_size=16, lr=8e-5, weight_decay=1e-5,
+    patience=6, val_split=0.15, test_split=0.10,
 )
 
 SECTOR_PEERS = {
@@ -547,12 +547,9 @@ if HEAVY_OK:
         if ohlcv_points and len(ohlcv_points) >= 60:
             logging.info(f"  Using frontend OHLCV for {ticker} ({len(ohlcv_points)} points)")
             provided_df = ohlcv_to_df(ohlcv_points)
-            peers_raw   = download_data(peers, DATA_START, DATA_END)
-            raw         = {ticker: provided_df, **peers_raw}
-            if not peers_raw:
-                raw   = {ticker: provided_df}
-                peers = []
-                all_t = [ticker]
+            raw   = {ticker: provided_df}
+            peers = []
+            all_t = [ticker]
         else:
             raw = download_data(all_t, DATA_START, DATA_END)
 
