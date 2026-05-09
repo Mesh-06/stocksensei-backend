@@ -565,7 +565,9 @@ if HEAVY_IMPORTS_OK:
             raise FileNotFoundError("Base model not found. Upload base_model.pt to the models/ directory.")
 
         ckpt     = torch.load(BASE_MODEL_PATH, map_location=DEVICE)
-        base_cfg = ckpt["base_config"]
+        base_cfg = ckpt.get("base_config", {})
+        for k, v in BASE_CONFIG.items():
+            base_cfg.setdefault(k, v)
         base_n   = len(ckpt["base_tickers"])
         ft_model = build_model(base_n, np.array(ckpt["adj_matrix"]), base_cfg)
         ft_model.load_state_dict(ckpt["model_state"])
