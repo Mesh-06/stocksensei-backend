@@ -20,6 +20,21 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import yfinance as yf
+yf.set_tz_cache_location("/tmp/yfinance_cache")
+
+# Patch yfinance session with browser headers
+import requests
+from requests.adapters import HTTPAdapter
+
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+})
+yf.base.requests = _session
+
 # ── Optional heavy imports (only needed when model is loaded) ──
 try:
     import numpy as np
@@ -138,17 +153,28 @@ if HEAVY_IMPORTS_OK:
 
     # ── Data download ──────────────────────────────────────────
     def download_data(tickers, start, end, verbose=True):
-        raw = {}
-        for t in tickers:
-            try:
-                df = yf.download(t, start=start, end=end, progress=False, auto_adjust=True)
-                if len(df) > 60:
-                    raw[t] = df
-                    if verbose:
-                        logging.info(f"  Downloaded {t}: {len(df)} rows")
-            except Exception as e:
-                logging.warning(f"  Failed {t}: {e}")
-        return raw
+    raw = {}
+    for t in tickers:
+        try:
+            ticker_obj = yf.Ticker(t)
+            ticker_obj.session = None
+            df = yf.download(
+                t,
+                start=start,
+                end=end,
+                progress=False,
+                auto_adjust=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                }
+            )
+            if len(df) > 60:
+                raw[t] = df
+                if verbose:
+                    logging.info(f"  Downloaded {t}: {len(df)} rows")
+        except Exception as e:
+            logging.warning(f"  Failed {t}: {e}")
+    return raw
 
     # ── Feature engineering ────────────────────────────────────
     def add_features(df):
