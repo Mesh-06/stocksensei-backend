@@ -1,0 +1,16 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+
+# ML
+torch==2.3.0
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+scipy==1.13.0
+yfinance==0.2.40
+ta==0.11.0
+joblib==1.4.2
+
+# Utils
+python-multipart==0.0.9
