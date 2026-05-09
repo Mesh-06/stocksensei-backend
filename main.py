@@ -1,26 +1,32 @@
 """
 Stock Sensei AI — FastAPI Backend
-Deploy on Railway (free tier) or any Python host.
-Serves the TGT model predictions to the Vercel frontend.
+Architecture exactly matches StockSensei_Universal_TGT_v3.ipynb
 """
 
-import os
-import json
-import time
-import warnings
-import logging
+import os, json, math, time, warnings, logging, re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
 
 warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
 
-# ── Optional heavy imports ──
+# ── One-time volume copy ──────────────────────────────────────
+_src = Path("base_model.pt")
+_dst_dir = Path(os.getenv("MODEL_DIR", "./models"))
+_dst_dir.mkdir(parents=True, exist_ok=True)
+_dst = _dst_dir / "base_model.pt"
+if _src.exists() and not _dst.exists():
+    import shutil
+    shutil.copy(_src, _dst)
+    logging.info("Copied base_model.pt to volume.")
+
+# ── Heavy imports ─────────────────────────────────────────────
 try:
     import numpy as np
     import pandas as pd
@@ -29,69 +35,84 @@ try:
     import torch.nn.functional as F
     from torch.utils.data import Dataset, DataLoader
     from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from scipy.stats import pearsonr
     import yfinance as yf
     yf.set_tz_cache_location("/tmp/yfinance_cache")
-    import ta
-    import joblib
-    from scipy.stats import pearsonr
-    HEAVY_IMPORTS_OK = True
+    import ta, joblib
+    HEAVY_OK = True
 except ImportError as e:
-    HEAVY_IMPORTS_OK = False
-    logging.warning(f"Heavy ML imports failed: {e}. Install requirements.txt first.")
+    HEAVY_OK = False
+    logging.warning(f"Heavy imports failed: {e}")
 
 # ─────────────────────────────────────────────────────────────
 #  App & CORS
 # ─────────────────────────────────────────────────────────────
 app = FastAPI(title="Stock Sensei AI", version="3.0.0")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 # ─────────────────────────────────────────────────────────────
-#  Paths & Config
+#  Config — EXACTLY matching notebook
 # ─────────────────────────────────────────────────────────────
 MODEL_DIR       = Path(os.getenv("MODEL_DIR", "./models"))
 BASE_MODEL_PATH = MODEL_DIR / "base_model.pt"
 REGISTRY_PATH   = MODEL_DIR / "registry.json"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-# One-time copy of base_model.pt to persistent volume
-_src = Path("base_model.pt")
-if _src.exists() and not BASE_MODEL_PATH.exists():
-    import shutil
-    BASE_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(_src, BASE_MODEL_PATH)
-    logging.info("Copied base_model.pt to volume.")
-
-DEVICE = "cuda" if (HEAVY_IMPORTS_OK and torch.cuda.is_available()) else "cpu"
-
-N_FEATURES = 18
-SEQ_LEN    = 30
-
-BASE_CONFIG = {
-    "seq_len": SEQ_LEN, "pred_len": 1,
-    "gcn_out_dim": 32, "gru_hidden": 64,
-    "transformer_dim": 64, "nhead": 4,
-    "dropout": 0.15, "lr": 3e-4,
-    "epochs": 60, "batch_size": 64,
-    "patience": 12, "weight_decay": 1e-5,
-}
-
-FINETUNE_CONFIG = {**BASE_CONFIG, "epochs": 30, "lr": 5e-5, "patience": 8}
+DEVICE = "cuda" if (HEAVY_OK and torch.cuda.is_available()) else "cpu"
+SEED   = 42
 
 FEATURE_COLS = [
-    "Close","Open","High","Low","Volume",
-    "rsi","macd","macd_signal","bb_upper","bb_lower","bb_mid",
-    "ema_20","ema_50","atr","obv","cci","stoch_k","return_1d",
+    "Close","log_return","ema_9","ema_21","ema_50","sma_20",
+    "macd","macd_sig","macd_diff","adx",
+    "rsi_14","stoch_k","stoch_d","cci","williams_r","roc",
+    "bb_high","bb_low","bb_mid","bb_width","atr",
+    "obv","vwap","mfi","cmf","volatility_5","price_range"
 ]
+N_FEATURES = len(FEATURE_COLS)
+CLOSE_IDX  = FEATURE_COLS.index("Close")
+
+BASE_CONFIG = dict(
+    seq_len=60, pred_horizon=5,
+    hidden_dim=128, num_gru_layers=2, num_heads=4, num_tf_layers=3,
+    dropout=0.2, gcn_out_dim=64,
+    epochs=120, batch_size=32, lr=3e-4, weight_decay=1e-5,
+    patience=18, val_split=0.15, test_split=0.10,
+)
+FINETUNE_CONFIG = dict(
+    seq_len=60, pred_horizon=5,
+    hidden_dim=128, num_gru_layers=2, num_heads=4, num_tf_layers=3,
+    dropout=0.2, gcn_out_dim=64,
+    epochs=60, batch_size=16, lr=8e-5, weight_decay=1e-5,
+    patience=12, val_split=0.15, test_split=0.10,
+)
+
+SECTOR_PEERS = {
+    "Technology":            ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS"],
+    "Energy":                ["RELIANCE.NS","ONGC.NS","IOC.NS","BPCL.NS","GAIL.NS"],
+    "Financial Services":    ["HDFCBANK.NS","ICICIBANK.NS","SBIN.NS","AXISBANK.NS","KOTAKBANK.NS"],
+    "Consumer Defensive":    ["HINDUNILVR.NS","NESTLEIND.NS","BRITANNIA.NS","DABUR.NS"],
+    "Healthcare":            ["SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","DIVISLAB.NS"],
+    "Industrials":           ["LT.NS","SIEMENS.NS","ABB.NS","BEL.NS","HAL.NS"],
+    "Basic Materials":       ["TATASTEEL.NS","JSWSTEEL.NS","HINDALCO.NS","COALINDIA.NS"],
+    "Consumer Cyclical":     ["MARUTI.NS","TATAMOTORS.NS","M&M.NS","BAJAJ-AUTO.NS"],
+    "Communication Services":["BHARTIARTL.NS","IDEA.NS","TATACOMM.NS"],
+    "US_Technology":         ["AAPL","MSFT","GOOGL","META","NVDA","AMD"],
+    "US_Financial":          ["JPM","BAC","GS","MS","WFC"],
+    "US_Healthcare":         ["JNJ","PFE","UNH","MRK","ABBV"],
+    "US_Energy":             ["XOM","CVX","COP","SLB","EOG"],
+    "US_Consumer":           ["AMZN","TSLA","HD","MCD","NKE"],
+    "UK_Energy":             ["BP.L","SHEL.L","SSE.L"],
+    "UK_Financial":          ["HSBA.L","LLOY.L","BARC.L","NWG.L"],
+}
+EXCHANGE_REGION = {".NS":"IN",".BO":"IN",".L":"UK",".T":"JP","":"US"}
 
 # ─────────────────────────────────────────────────────────────
-#  Pydantic Models
+#  Pydantic models
 # ─────────────────────────────────────────────────────────────
 class OHLCVPoint(BaseModel):
     date: str
@@ -104,452 +125,434 @@ class OHLCVPoint(BaseModel):
 class AnalyzeRequest(BaseModel):
     ticker: str
     force_retrain: bool = False
-    ohlcv: Optional[List[OHLCVPoint]] = None  # sent from frontend to skip Yahoo download
+    ohlcv: Optional[List[OHLCVPoint]] = None
 
 class PredictionResult(BaseModel):
     ticker: str
     last_close: float
     last_date: str
-    predicted_prices: list[float]
+    predicted_prices: list
     predictions: dict
     change_pct_day1: float
     trend: str
     signal: str
-    peers_used: list[str]
+    peers_used: list
     generated_at: str
     metrics: Optional[dict] = None
 
 # ─────────────────────────────────────────────────────────────
-#  Registry helpers
+#  Registry
 # ─────────────────────────────────────────────────────────────
-def load_registry() -> dict:
+def load_registry():
     if REGISTRY_PATH.exists():
-        with open(REGISTRY_PATH) as f:
-            return json.load(f)
+        with open(REGISTRY_PATH) as f: return json.load(f)
     return {}
 
-def save_registry(reg: dict):
-    with open(REGISTRY_PATH, "w") as f:
-        json.dump(reg, f, indent=2)
+def save_registry(reg):
+    with open(REGISTRY_PATH, "w") as f: json.dump(reg, f, indent=2)
 
 def register_stock(ticker, metrics, peers, model_path):
     reg = load_registry()
     reg[ticker] = {
-        "ticker": ticker,
-        "model_path": str(model_path),
-        "peers": peers,
-        "last_trained": datetime.now().isoformat(),
+        "ticker": ticker, "model_path": str(model_path),
+        "peers": peers, "last_trained": datetime.now().isoformat(),
         "metrics": {k: round(float(v), 4) for k, v in metrics.items()},
         "status": "ready",
     }
     save_registry(reg)
 
 # ─────────────────────────────────────────────────────────────
-#  ML Utilities
+#  ML code (only defined when imports available)
 # ─────────────────────────────────────────────────────────────
-if HEAVY_IMPORTS_OK:
+if HEAVY_OK:
 
-    # ── Convert frontend OHLCV list → DataFrame ────────────────
-    def ohlcv_to_df(ohlcv_points: List[OHLCVPoint]) -> pd.DataFrame:
-        records = [
-            {
-                "Date":   p.date,
-                "Open":   p.open,
-                "High":   p.high,
-                "Low":    p.low,
-                "Close":  p.close,
-                "Volume": p.volume,
-            }
-            for p in ohlcv_points
-        ]
+    # ── Model architecture — EXACT copy from notebook ────────
+    class GCNLayer(nn.Module):
+        def __init__(self, in_f, out_f, adj, drop=0.1):
+            super().__init__()
+            self.fc = nn.Linear(in_f, out_f)
+            self.drop = nn.Dropout(drop)
+            self.act = nn.GELU()
+            A = torch.tensor(adj, dtype=torch.float32)
+            D = A.sum(1); Di = torch.diag(D.pow(-0.5))
+            self.register_buffer("AN", Di @ A @ Di)
+        def forward(self, x):
+            return self.drop(self.act(self.fc(self.AN @ x)))
+
+    class GCNEncoder(nn.Module):
+        def __init__(self, in_d, hid, out_d, adj, drop=0.1):
+            super().__init__()
+            self.g1 = GCNLayer(in_d, hid, adj, drop)
+            self.g2 = GCNLayer(hid, out_d, adj, drop)
+            self.proj = nn.Linear(in_d, out_d)
+            self.norm = nn.LayerNorm(out_d)
+        def forward(self, x):
+            return self.norm(self.g2(self.g1(x)) + self.proj(x))
+
+    class PosEnc(nn.Module):
+        def __init__(self, d, maxlen=512, drop=0.1):
+            super().__init__(); self.drop = nn.Dropout(drop)
+            pe = torch.zeros(maxlen, d)
+            pos = torch.arange(maxlen).unsqueeze(1).float()
+            div = torch.exp(torch.arange(0, d, 2).float() * (-math.log(10000) / d))
+            pe[:, 0::2] = torch.sin(pos * div); pe[:, 1::2] = torch.cos(pos * div)
+            self.register_buffer("pe", pe.unsqueeze(0))
+        def forward(self, x):
+            return self.drop(x + self.pe[:, :x.size(1)])
+
+    class TGT(nn.Module):
+        def __init__(self, n_feat, n_stocks, adj, gcn_out=64, hidden=128,
+                     n_gru=2, n_heads=4, n_tf=3, horizon=5, drop=0.2, seq_len=60):
+            super().__init__()
+            self.gcn_out = gcn_out; self.hidden = hidden
+            self.gcn = GCNEncoder(n_feat, gcn_out * 2, gcn_out, adj, drop)
+            self.gru_proj = nn.Linear(n_feat + gcn_out, hidden)
+            self.gru = nn.GRU(hidden, hidden, n_gru, batch_first=True,
+                              dropout=drop if n_gru > 1 else 0)
+            self.gru_norm = nn.LayerNorm(hidden)
+            self.tf_proj = nn.Linear(n_feat, hidden)
+            self.pe = PosEnc(hidden, seq_len + 10, drop)
+            enc = nn.TransformerEncoderLayer(hidden, n_heads, hidden * 4, drop,
+                                             batch_first=True, activation="gelu")
+            self.tf = nn.TransformerEncoder(enc, n_tf, nn.LayerNorm(hidden))
+            self.alpha = nn.Parameter(torch.ones(3) / 3)
+            self.head = nn.Sequential(
+                nn.Linear(hidden, hidden // 2), nn.GELU(),
+                nn.Dropout(drop), nn.Linear(hidden // 2, horizon))
+            self._init()
+
+        def _init(self):
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None: nn.init.zeros_(m.bias)
+
+        def replace_adj(self, adj):
+            A = torch.tensor(adj, dtype=torch.float32).to(next(self.parameters()).device)
+            D = A.sum(1); Di = torch.diag(D.pow(-0.5)); AN = Di @ A @ Di
+            for g in [self.gcn.g1, self.gcn.g2]: g.AN = AN
+
+        def forward(self, xg, xs):
+            B, T, N, F_ = xg.shape
+            gcn_out = self.gcn(xg.view(B * T, N, F_))[:, 0, :].view(B, T, -1)
+            gi = self.gru_proj(torch.cat([xs, gcn_out], -1))
+            go, _ = self.gru(gi); gl = self.gru_norm(go)[:, -1, :]
+            tl = self.tf(self.pe(self.tf_proj(xs)))[:, -1, :]
+            pad = self.hidden - self.gcn_out
+            gs_ = F.pad(gcn_out.mean(1), (0, pad)) if pad > 0 else gcn_out.mean(1)
+            a = torch.softmax(self.alpha, 0)
+            return self.head(a[0] * gl + a[1] * tl + a[2] * gs_)
+
+    def build_model(n_stocks, adj, cfg=None):
+        cfg = cfg or BASE_CONFIG
+        return TGT(
+            N_FEATURES, n_stocks, adj,
+            gcn_out=cfg["gcn_out_dim"], hidden=cfg["hidden_dim"],
+            n_gru=cfg["num_gru_layers"], n_heads=cfg["num_heads"],
+            n_tf=cfg["num_tf_layers"], horizon=cfg["pred_horizon"],
+            drop=cfg["dropout"], seq_len=cfg["seq_len"],
+        ).to(DEVICE)
+
+    # ── Feature engineering — EXACT copy from notebook ───────
+    def add_features(df):
+        c = df["Close"].squeeze(); h = df["High"].squeeze()
+        l = df["Low"].squeeze();   v = df["Volume"].squeeze()
+        df["ema_9"]    = ta.trend.EMAIndicator(c, 9).ema_indicator()
+        df["ema_21"]   = ta.trend.EMAIndicator(c, 21).ema_indicator()
+        df["ema_50"]   = ta.trend.EMAIndicator(c, 50).ema_indicator()
+        df["sma_20"]   = ta.trend.SMAIndicator(c, 20).sma_indicator()
+        macd = ta.trend.MACD(c)
+        df["macd"] = macd.macd(); df["macd_sig"] = macd.macd_signal(); df["macd_diff"] = macd.macd_diff()
+        df["adx"]      = ta.trend.ADXIndicator(h, l, c).adx()
+        df["rsi_14"]   = ta.momentum.RSIIndicator(c, 14).rsi()
+        st = ta.momentum.StochasticOscillator(h, l, c)
+        df["stoch_k"] = st.stoch(); df["stoch_d"] = st.stoch_signal()
+        df["cci"]      = ta.trend.CCIIndicator(h, l, c).cci()
+        df["williams_r"] = ta.momentum.WilliamsRIndicator(h, l, c).williams_r()
+        df["roc"]      = ta.momentum.ROCIndicator(c).roc()
+        bb = ta.volatility.BollingerBands(c)
+        df["bb_high"] = bb.bollinger_hband(); df["bb_low"] = bb.bollinger_lband()
+        df["bb_mid"] = bb.bollinger_mavg();   df["bb_width"] = bb.bollinger_wband()
+        df["atr"]      = ta.volatility.AverageTrueRange(h, l, c).average_true_range()
+        df["obv"]      = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume()
+        df["vwap"]     = ta.volume.VolumeWeightedAveragePrice(h, l, c, v).volume_weighted_average_price()
+        df["mfi"]      = ta.volume.MFIIndicator(h, l, c, v).money_flow_index()
+        df["cmf"]      = ta.volume.ChaikinMoneyFlowIndicator(h, l, c, v).chaikin_money_flow()
+        df["log_return"]    = np.log(c / c.shift(1))
+        df["volatility_5"]  = df["log_return"].rolling(5).std()
+        df["price_range"]   = (h - l) / c
+        df.dropna(inplace=True)
+        keep = [f for f in FEATURE_COLS if f in df.columns]
+        extra = [x for x in ["Open","High","Low","Volume"] if x in df.columns and x not in keep]
+        return df[keep + extra]
+
+    # ── Convert frontend OHLCV → DataFrame with features ─────
+    def ohlcv_to_df(ohlcv_points):
+        records = [{"Date": p.date, "Open": p.open, "High": p.high,
+                    "Low": p.low, "Close": p.close, "Volume": p.volume}
+                   for p in ohlcv_points]
         df = pd.DataFrame(records)
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.set_index("Date").sort_index()
+        df = add_features(df)
         return df
 
-    # ── Data download (used for peers only when frontend sends OHLCV) ─
+    # ── Download (for peers only) ─────────────────────────────
     def download_data(tickers, start, end, verbose=True):
-        raw = {}
+        result = {}
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
         })
         for t in tickers:
             for attempt in range(3):
                 try:
                     yticker = yf.Ticker(t, session=session)
                     df = yticker.history(start=start, end=end, auto_adjust=True)
-                    if df is not None and len(df) > 60:
-                        raw[t] = df
-                        if verbose:
-                            logging.info(f"  Downloaded {t}: {len(df)} rows")
-                        break
-                    else:
-                        time.sleep(2)
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df.dropna(inplace=True)
+                    if len(df) < 120:
+                        time.sleep(2); continue
+                    df = add_features(df)
+                    result[t] = df
+                    if verbose: logging.info(f"  {t}: {len(df)} rows")
+                    break
                 except Exception as e:
                     logging.warning(f"  Attempt {attempt+1} failed for {t}: {e}")
                     time.sleep(3)
-        return raw
+        return result
 
-    # ── Feature engineering ────────────────────────────────────
-    def add_features(df):
-        d = df.copy()
-        if isinstance(d.columns, pd.MultiIndex):
-            d.columns = d.columns.get_level_values(0)
-        for col in ["Close","Open","High","Low","Volume"]:
-            if col not in d.columns:
-                d[col] = 0.0
-        cl = d["Close"].squeeze()
-        d["rsi"]         = ta.momentum.RSIIndicator(cl, window=14).rsi()
-        macd_obj         = ta.trend.MACD(cl)
-        d["macd"]        = macd_obj.macd()
-        d["macd_signal"] = macd_obj.macd_signal()
-        bb               = ta.volatility.BollingerBands(cl, window=20)
-        d["bb_upper"]    = bb.bollinger_hband()
-        d["bb_lower"]    = bb.bollinger_lband()
-        d["bb_mid"]      = bb.bollinger_mavg()
-        d["ema_20"]      = ta.trend.EMAIndicator(cl, window=20).ema_indicator()
-        d["ema_50"]      = ta.trend.EMAIndicator(cl, window=50).ema_indicator()
-        d["atr"]         = ta.volatility.AverageTrueRange(d["High"].squeeze(), d["Low"].squeeze(), cl).average_true_range()
-        d["obv"]         = ta.volume.OnBalanceVolumeIndicator(cl, d["Volume"].squeeze()).on_balance_volume()
-        d["cci"]         = ta.trend.CCIIndicator(d["High"].squeeze(), d["Low"].squeeze(), cl).cci()
-        d["stoch_k"]     = ta.momentum.StochasticOscillator(d["High"].squeeze(), d["Low"].squeeze(), cl).stoch()
-        d["return_1d"]   = cl.pct_change()
-        d = d[FEATURE_COLS].copy()
-        d.replace([np.inf, -np.inf], np.nan, inplace=True)
-        d.ffill(inplace=True)
-        d.bfill(inplace=True)
-        d.dropna(inplace=True)
-        return d
-
-    # ── Graph builder ──────────────────────────────────────────
-    def build_graph(raw_dict, threshold=0.5):
-        tickers = list(raw_dict.keys())
-        closes  = {}
-        for t in tickers:
-            df = raw_dict[t]
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            closes[t] = df["Close"].squeeze()
-        common = sorted(set.intersection(*[set(closes[t].index) for t in tickers]))
-        mat    = pd.DataFrame({t: closes[t].loc[common] for t in tickers})
-        n      = len(tickers)
-        corr   = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    corr[i, j] = 1.0
-                elif j > i:
-                    try:
-                        r, _ = pearsonr(mat.iloc[:, i].values, mat.iloc[:, j].values)
-                        corr[i, j] = corr[j, i] = abs(r)
-                    except Exception:
-                        corr[i, j] = corr[j, i] = 0.0
-        adj = (corr >= threshold).astype(float)
-        np.fill_diagonal(adj, 1.0)
-        return adj, tickers, corr
-
-    # ── Scaling ────────────────────────────────────────────────
-    def scale_data(raw_dict, target, fit=True):
-        tickers = list(raw_dict.keys())
-        feat    = {t: add_features(raw_dict[t]) for t in tickers}
-        common  = sorted(set.intersection(*[set(feat[t].index) for t in tickers]))
-        scalers = {}
-        scaled  = {}
-        for t in tickers:
-            scaler = MinMaxScaler()
-            data   = feat[t].loc[common]
-            if fit:
-                scaled[t] = scaler.fit_transform(data.values)
-            else:
-                scaled[t] = scaler.transform(data.values)
-            scalers[t] = scaler
-        close_scaler = MinMaxScaler()
-        close_col    = feat[target]["Close"].loc[common].values.reshape(-1, 1)
-        close_scaler.fit_transform(close_col)
-        scalers["__close__"] = close_scaler
-        return scaled, scalers, common
-
-    # ── Dataset ────────────────────────────────────────────────
-    class StockDataset(Dataset):
-        def __init__(self, scaled_dict, tickers, target, seq_len, pred_len=1):
-            n, f = scaled_dict[target].shape
-            self.X, self.y = [], []
-            for i in range(seq_len, n - pred_len + 1):
-                x = np.stack([scaled_dict[t][i - seq_len: i] for t in tickers], axis=0)
-                y = scaled_dict[target][i: i + pred_len, 0]
-                self.X.append(x)
-                self.y.append(y)
-            self.X = torch.tensor(np.array(self.X), dtype=torch.float32)
-            self.y = torch.tensor(np.array(self.y), dtype=torch.float32)
-
-        def __len__(self):  return len(self.X)
-        def __getitem__(self, i): return self.X[i], self.y[i]
-
-    def make_loaders(scaled, tickers, target, cfg):
-        ds  = StockDataset(scaled, tickers, target, cfg["seq_len"], cfg["pred_len"])
-        n   = len(ds)
-        ntr = int(n * 0.7)
-        nva = int(n * 0.15)
-        nte = n - ntr - nva
-        tr, va, te = torch.utils.data.random_split(ds, [ntr, nva, nte])
-        return (
-            DataLoader(tr, batch_size=cfg["batch_size"], shuffle=True),
-            DataLoader(va, batch_size=cfg["batch_size"]),
-            DataLoader(te, batch_size=cfg["batch_size"]),
-            ntr, nva, nte,
-        )
-
-    # ── Model ──────────────────────────────────────────────────
-    class GCNEncoder(nn.Module):
-        def __init__(self, in_f, hidden, out_f, adj, dropout=0.15):
-            super().__init__()
-            self.adj = torch.tensor(adj, dtype=torch.float32).to(DEVICE)
-            self.fc1 = nn.Linear(in_f, hidden)
-            self.fc2 = nn.Linear(hidden, out_f)
-            self.drop = nn.Dropout(dropout)
-        def forward(self, x):
-            B, N, S, F = x.shape
-            a = self.adj.unsqueeze(0).expand(B, -1, -1)
-            h = x.mean(dim=2)
-            h = torch.bmm(a, h)
-            h = F.relu(self.fc1(h))
-            h = self.drop(h)
-            h = torch.bmm(a, h)
-            h = self.fc2(h)
-            return h[:, 0, :]
-
-    class TGTModel(nn.Module):
-        def __init__(self, n_nodes, adj, cfg):
-            super().__init__()
-            d = cfg["gcn_out_dim"]
-            self.gcn = GCNEncoder(N_FEATURES, d * 2, d, adj, cfg["dropout"])
-            self.gru = nn.GRU(N_FEATURES, cfg["gru_hidden"], batch_first=True, num_layers=2,
-                              dropout=cfg["dropout"])
-            enc_layer = nn.TransformerEncoderLayer(d_model=cfg["transformer_dim"],
-                                                   nhead=cfg["nhead"], dropout=cfg["dropout"],
-                                                   batch_first=True)
-            self.transformer = nn.TransformerEncoder(enc_layer, num_layers=2)
-            self.proj = nn.Linear(N_FEATURES, cfg["transformer_dim"])
-            total_in = d + cfg["gru_hidden"] + cfg["transformer_dim"]
-            self.alpha = nn.Parameter(torch.ones(3) / 3)
-            self.head = nn.Sequential(
-                nn.Linear(total_in, 64), nn.SiLU(), nn.Dropout(cfg["dropout"]),
-                nn.Linear(64, 32),       nn.SiLU(),
-                nn.Linear(32, cfg["pred_len"]),
-            )
-
-        def replace_adj(self, new_adj):
-            self.gcn.adj = torch.tensor(new_adj, dtype=torch.float32).to(DEVICE)
-
-        def forward(self, x):
-            B, N, S, F = x.shape
-            gcn_out = self.gcn(x)
-            gru_in  = x[:, 0, :, :]
-            gru_out, _ = self.gru(gru_in)
-            gru_out = gru_out[:, -1, :]
-            tr_in   = self.proj(gru_in)
-            tr_out  = self.transformer(tr_in)[:, -1, :]
-            w = F.softmax(self.alpha, dim=0)
-            fused = w[0] * gcn_out + w[1] * gru_out + w[2] * tr_out
-            return self.head(fused)
-
-    def build_model(n_nodes, adj, cfg):
-        return TGTModel(n_nodes, adj, cfg).to(DEVICE)
-
-    # ── Training ───────────────────────────────────────────────
-    def train_model(model, tr_loader, va_loader, cfg, label="", freeze_backbone=False):
-        if freeze_backbone:
-            for name, p in model.named_parameters():
-                if "head" not in name:
-                    p.requires_grad = False
-        opt = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=cfg["lr"], weight_decay=cfg["weight_decay"],
-        )
-        sched = torch.optim.lr_scheduler.OneCycleLR(
-            opt, max_lr=cfg["lr"], steps_per_epoch=len(tr_loader), epochs=cfg["epochs"],
-        )
-        loss_fn = nn.HuberLoss()
-        best_val = float("inf")
-        best_state = None
-        patience_ctr = 0
-        history = {"train": [], "val": []}
-
-        for epoch in range(cfg["epochs"]):
-            model.train()
-            tr_loss = 0
-            for xb, yb in tr_loader:
-                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                pred = model(xb)
-                loss = loss_fn(pred, yb)
-                opt.zero_grad(); loss.backward(); opt.step(); sched.step()
-                tr_loss += loss.item()
-            tr_loss /= len(tr_loader)
-
-            model.eval()
-            va_loss = 0
-            with torch.no_grad():
-                for xb, yb in va_loader:
-                    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                    va_loss += loss_fn(model(xb), yb).item()
-            va_loss /= len(va_loader)
-            history["train"].append(tr_loss)
-            history["val"].append(va_loss)
-
-            if va_loss < best_val:
-                best_val = va_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-                if patience_ctr >= cfg["patience"]:
-                    break
-
-        if best_state:
-            model.load_state_dict(best_state)
-        return history, best_val
-
-    # ── Metrics ────────────────────────────────────────────────
-    def compute_metrics(actual, predicted):
-        a, p = np.array(actual), np.array(predicted)
-        rmse = float(np.sqrt(np.mean((a - p) ** 2)))
-        mape = float(np.mean(np.abs((a - p) / (np.abs(a) + 1e-8))) * 100)
-        dir_acc = float(np.mean(np.sign(np.diff(a)) == np.sign(np.diff(p))) * 100)
-        return {"RMSE": rmse, "MAPE": mape, "DirectionalAccuracy": dir_acc}
-
-    def get_predictions(model, loader, close_scaler):
-        model.eval()
-        preds, trues = [], []
-        with torch.no_grad():
-            for xb, yb in loader:
-                out = model(xb.to(DEVICE)).cpu().numpy()
-                preds.append(out)
-                trues.append(yb.numpy())
-        preds = np.concatenate(preds)
-        trues = np.concatenate(trues)
-        p_inv = close_scaler.inverse_transform(preds)
-        t_inv = close_scaler.inverse_transform(trues)
-        return preds, trues, p_inv.squeeze(), t_inv.squeeze()
-
-    # ── Auto peer detection ────────────────────────────────────
-    SECTOR_PEERS = {
-        "tech":    ["TCS.NS","INFY.NS","WIPRO.NS","TECHM.NS","HCLTECH.NS","AAPL","MSFT","GOOGL","META","NVDA"],
-        "bank":    ["HDFCBANK.NS","ICICIBANK.NS","AXISBANK.NS","KOTAKBANK.NS","SBIN.NS","JPM","BAC","WFC","GS"],
-        "energy":  ["ONGC.NS","RELIANCE.NS","BPCL.NS","IOC.NS","XOM","CVX","BP.L","SHEL.L"],
-        "pharma":  ["SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","DIVISLAB.NS","JNJ","PFE","MRK","ABBV"],
-        "auto":    ["MARUTI.NS","TATAMOTORS.NS","BAJAJ-AUTO.NS","HEROMOTOCO.NS","TSLA","F","GM","TM"],
-        "fmcg":    ["HINDUNILVR.NS","ITC.NS","NESTLEIND.NS","BRITANNIA.NS","PG","KO","PEP","NESN.SW"],
-        "metal":   ["TATASTEEL.NS","JSWSTEEL.NS","HINDALCO.NS","VEDL.NS","NUE","X","AA"],
-        "telecom": ["BHARTIARTL.NS","VIL.NS","RELIANCE.NS","T","VZ","VOD.L"],
-        "realty":  ["DLF.NS","GODREJPROP.NS","OBEROIRLTY.NS","PLD","AMT","SPG"],
-        "us_tech": ["AAPL","MSFT","GOOGL","META","NVDA","AMZN","TSLA","AMD","INTC","CRM"],
-    }
+    def get_suffix(ticker):
+        m = re.search(r"(\.[A-Z]+)$", ticker)
+        return m.group(1) if m else ""
 
     def auto_peers(ticker, n=4):
-        t = ticker.upper()
-        for sector, peers in SECTOR_PEERS.items():
-            if t in peers:
-                return [p for p in peers if p != t][:n]
-        if ".NS" in t or ".BO" in t:
-            return ["TCS.NS","INFY.NS","HDFCBANK.NS","RELIANCE.NS"][:n]
-        return ["AAPL","MSFT","GOOGL","AMZN"][:n]
+        suffix = get_suffix(ticker)
+        region = EXCHANGE_REGION.get(suffix, "US")
+        peers = []
+        for key, plist in SECTOR_PEERS.items():
+            if any(ticker in plist for _ in [1]):
+                peers = [p for p in plist if p != ticker][:n]; break
+        if not peers:
+            if region == "IN":   peers = ["RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS"]
+            elif region == "UK": peers = ["BP.L","HSBA.L","BARC.L","LLOY.L"]
+            else:                peers = ["SPY","QQQ","MSFT","GOOGL"]
+        return [p for p in peers if p != ticker][:n]
 
-    # ── Core prediction ────────────────────────────────────────
-    def _run_prediction(ticker, model, scalers, graph_tickers, raw_dict=None):
-        ticker = ticker.upper()
-        if raw_dict is None:
-            end   = datetime.today().strftime("%Y-%m-%d")
-            start = (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d")
-            raw_dict = download_data(graph_tickers, start, end, verbose=False)
+    def build_graph(processed, threshold=0.25):
+        tickers = list(processed.keys()); n = len(tickers)
+        rets = {t: processed[t]["log_return"].dropna() for t in tickers if "log_return" in processed[t]}
+        common = None
+        for s in rets.values(): common = s.index if common is None else common.intersection(s.index)
+        corr = np.eye(n)
+        for i in range(n):
+            for j in range(i + 1, n):
+                try:
+                    r, _ = pearsonr(rets[tickers[i]].loc[common], rets[tickers[j]].loc[common])
+                    corr[i, j] = corr[j, i] = r
+                except Exception: pass
+        adj = (np.abs(corr) > threshold).astype(float); np.fill_diagonal(adj, 1.0)
+        return adj, tickers, corr
 
-        df = raw_dict.get(ticker)
-        if df is None:
-            raise ValueError(f"No data for {ticker}")
+    def scale_data(processed, target, fit=True, existing=None):
+        common = None
+        for df in processed.values():
+            idx = df[[f for f in FEATURE_COLS if f in df.columns]].dropna().index
+            common = idx if common is None else common.intersection(idx)
+        scalers, scaled = {}, {}
+        for t, df in processed.items():
+            fc = [f for f in FEATURE_COLS if f in df.columns]
+            arr = df.loc[common, fc].values
+            if fit or existing is None:
+                sc = MinMaxScaler((0, 1)); arr = sc.fit_transform(arr)
+            else:
+                sc = existing.get(t, MinMaxScaler((0, 1)).fit(arr)); arr = sc.transform(arr)
+            scalers[t] = sc; scaled[t] = arr
+        csc = MinMaxScaler()
+        cv = processed[target].loc[common, ["Close"]].values
+        if fit or existing is None: csc.fit(cv)
+        else: csc = existing.get("__close__", MinMaxScaler().fit(cv))
+        scalers["__close__"] = csc
+        return scaled, scalers, common
 
-        feat      = add_features(df)
-        close_sc  = scalers["__close__"]
-        target_sc = scalers.get(ticker, scalers.get(list(scalers.keys())[0]))
-        raw_seq   = feat[FEATURE_COLS].values[-SEQ_LEN:]
-        scaled_seq = target_sc.transform(raw_seq)
-        x = torch.tensor(scaled_seq, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(DEVICE)
-        n_nodes = model.gcn.adj.shape[0]
-        x = x.expand(-1, n_nodes, -1, -1)
+    class StockDataset(Dataset):
+        def __init__(self, scaled, tickers, target, seq_len, horizon):
+            self.seq_len = seq_len; self.horizon = horizon
+            self.target_idx = tickers.index(target)
+            T = scaled[tickers[0]].shape[0]
+            self.data = np.stack([scaled[t] for t in tickers], axis=1)
+            self.idx = list(range(seq_len, T - horizon + 1))
+        def __len__(self): return len(self.idx)
+        def __getitem__(self, i):
+            t = self.idx[i]
+            xg = torch.tensor(self.data[t - self.seq_len:t], dtype=torch.float32)
+            xs = xg[:, self.target_idx, :]
+            y = torch.tensor(self.data[t:t + self.horizon, self.target_idx, CLOSE_IDX], dtype=torch.float32)
+            return xg, xs, y
 
-        model.eval()
-        prices = []
+    def make_loaders(scaled, tickers, target, cfg):
+        ds = StockDataset(scaled, tickers, target, cfg["seq_len"], cfg["pred_horizon"])
+        N = len(ds)
+        nte = max(1, int(N * cfg.get("test_split", 0.10)))
+        nva = max(1, int(N * cfg.get("val_split", 0.15)))
+        ntr = N - nva - nte
+        tr, va, te = torch.utils.data.random_split(
+            ds, [ntr, nva, nte], generator=torch.Generator().manual_seed(SEED))
+        bs = cfg["batch_size"]
+        return (DataLoader(tr, batch_size=bs, shuffle=True, drop_last=True),
+                DataLoader(va, batch_size=bs, shuffle=False),
+                DataLoader(te, batch_size=bs, shuffle=False),
+                ntr, nva, nte)
+
+    class HybridLoss(nn.Module):
+        def __init__(self, a=0.7):
+            super().__init__(); self.a = a
+            self.mse = nn.MSELoss(); self.mae = nn.L1Loss()
+        def forward(self, p, t): return self.a * self.mse(p, t) + (1 - self.a) * self.mae(p, t)
+
+    def train_model(model, tr_l, va_l, cfg, label=""):
+        for p in model.parameters(): p.requires_grad = True
+        crit = HybridLoss()
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-5))
+        sched = torch.optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=cfg["lr"] * 8, epochs=cfg["epochs"],
+            steps_per_epoch=len(tr_l), pct_start=0.3, anneal_strategy="cos")
+        best_val, best_state, pat = float("inf"), None, 0
+        for ep in range(1, cfg["epochs"] + 1):
+            model.train(); tl = 0
+            for xg, xs, yb in tr_l:
+                xg, xs, yb = xg.to(DEVICE), xs.to(DEVICE), yb.to(DEVICE)
+                loss = crit(model(xg, xs), yb)
+                opt.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step(); sched.step(); tl += loss.item() * xg.size(0)
+            model.eval(); vl = 0
+            with torch.no_grad():
+                for xg, xs, yb in va_l:
+                    vl += crit(model(xg.to(DEVICE), xs.to(DEVICE)), yb.to(DEVICE)).item() * xg.size(0)
+            tl /= len(tr_l.dataset); vl /= len(va_l.dataset)
+            if vl < best_val:
+                best_val = vl
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                pat = 0
+            else:
+                pat += 1
+            interval = max(1, cfg["epochs"] // 6)
+            if ep % interval == 0 or ep == 1:
+                logging.info(f"  [{label}] Ep {ep}/{cfg['epochs']} train={tl:.5f} val={vl:.5f}")
+            if pat >= cfg["patience"]:
+                logging.info(f"  Early stop @ epoch {ep}"); break
+        model.load_state_dict(best_state); model.eval()
+        return best_val
+
+    def compute_metrics(t, p):
+        mae  = mean_absolute_error(t, p)
+        rmse = np.sqrt(mean_squared_error(t, p))
+        mape = np.mean(np.abs((t - p) / (np.abs(t) + 1e-8))) * 100
+        r2   = r2_score(t, p)
+        corr = np.corrcoef(t.ravel(), p.ravel())[0, 1]
+        da   = (np.sign(np.diff(t)) == np.sign(np.diff(p))).mean() * 100
+        return dict(MAE=mae, RMSE=rmse, MAPE=mape, R2=r2, Correlation=corr, DirectionalAccuracy=da)
+
+    def get_predictions(model, loader, close_scaler):
+        model.eval(); ps, ts = [], []
         with torch.no_grad():
-            inp = x.clone()
-            for _ in range(5):
-                out = model(inp)
-                price_sc = out.cpu().numpy()[0, 0]
-                price    = float(close_sc.inverse_transform([[price_sc]])[0, 0])
-                prices.append(price)
-                new_row = inp[:, :, -1:, :].clone()
-                new_row[:, 0, 0, 0] = out.squeeze()
-                inp = torch.cat([inp[:, :, 1:, :], new_row], dim=2)
+            for xg, xs, yb in loader:
+                ps.append(model(xg.to(DEVICE), xs.to(DEVICE)).cpu().numpy())
+                ts.append(yb.numpy())
+        ps = np.concatenate(ps); ts = np.concatenate(ts)
+        p_inv = close_scaler.inverse_transform(ps[:, 0:1]).ravel()
+        t_inv = close_scaler.inverse_transform(ts[:, 0:1]).ravel()
+        return ps, ts, p_inv, t_inv
 
-        lc        = float(feat["Close"].iloc[-1])
-        last_date = str(feat.index[-1].date())
+    def _run_prediction(ticker, model, scalers, graph_t, raw_override=None):
+        end   = datetime.today().strftime("%Y-%m-%d")
+        start = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+        if raw_override:
+            fresh = {t: raw_override[t] for t in graph_t if t in raw_override}
+        else:
+            fresh = download_data(graph_t, start, end, verbose=False)
 
-        future_dates = []
-        d = datetime.strptime(last_date, "%Y-%m-%d")
-        count = 0
-        while count < 5:
-            d += timedelta(days=1)
-            if d.weekday() < 5:
-                future_dates.append(d.strftime("%Y-%m-%d"))
-                count += 1
+        common = None
+        for t in fresh:
+            idx = fresh[t][[f for f in FEATURE_COLS if f in fresh[t].columns]].dropna().index
+            common = idx if common is None else common.intersection(idx)
 
-        predictions = {dt: round(p, 2) for dt, p in zip(future_dates, prices)}
+        seq_len = 60
+        if common is None or len(common) < seq_len:
+            raise ValueError(f"Not enough data ({len(common) if common is not None else 0} rows).")
 
+        def _sc(t):
+            fc  = [f for f in FEATURE_COLS if f in fresh[t].columns]
+            arr = fresh[t].loc[common, fc].values
+            return scalers[t].transform(arr) if t in scalers else MinMaxScaler((0, 1)).fit_transform(arr)
+
+        sf   = {t: _sc(t) for t in graph_t if t in fresh}
+        x_g  = np.stack([sf[t][-seq_len:] for t in graph_t if t in sf], axis=1)
+        x_g  = torch.tensor(x_g, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        x_s  = torch.tensor(sf[graph_t[0]][-seq_len:], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+        with torch.no_grad():
+            ps = model(x_g, x_s).cpu().numpy()
+
+        preds = scalers["__close__"].inverse_transform(ps).ravel()
+        lc    = float(np.array(fresh[graph_t[0]]["Close"].squeeze().values).ravel()[-1])
+        ld    = common[-1]
+        fut   = pd.bdate_range(start=ld, periods=len(preds) + 1)[1:]
+
+        def _f(x): return round(float(x), 4)
+        prices = [_f(p) for p in preds]
         return {
             "ticker":           ticker,
-            "last_close":       round(lc, 2),
-            "last_date":        last_date,
-            "predicted_prices": [round(p, 2) for p in prices],
-            "predictions":      predictions,
-            "change_pct_day1":  round((prices[0] - lc) / (lc + 1e-8) * 100, 4),
+            "last_close":       _f(lc),
+            "last_date":        str(ld.date()),
+            "predicted_prices": prices,
+            "predictions":      {d.strftime("%Y-%m-%d"): p for d, p in zip(fut, prices)},
+            "change_pct_day1":  _f((prices[0] - lc) / (lc + 1e-8) * 100),
             "trend":            "UPTREND" if prices[-1] > prices[0] else "DOWNTREND",
             "signal":           "BUY" if prices[0] > lc else "SELL",
-            "peers_used":       graph_tickers[1:],
+            "peers_used":       graph_t[1:],
             "generated_at":     datetime.now().isoformat(),
         }
 
-    # ── Fine-tune flow ─────────────────────────────────────────
     def run_fine_tune(ticker: str, force_retrain: bool = False, ohlcv_points=None) -> dict:
         ticker = ticker.upper()
         mp = MODEL_DIR / f"{ticker.replace('.','_')}_model.pt"
         sp = MODEL_DIR / f"{ticker.replace('.','_')}_scalers.pkl"
-
         reg = load_registry()
 
-        # ── Already trained → quick predict ──────────────────────
+        # ── Already trained → quick predict ──────────────────
         if ticker in reg and not force_retrain and mp.exists() and sp.exists():
             ckpt = torch.load(mp, map_location=DEVICE)
             art  = joblib.load(sp)
-            sc   = art["scalers"]
-            gt   = art["graph_tickers"]
-            m    = build_model(len(gt), np.array(ckpt["adj_matrix"]), ckpt["base_config"])
-            m.load_state_dict(ckpt["model_state"])
-            raw_dict = {ticker: ohlcv_to_df(ohlcv_points)} if ohlcv_points else None
-            result = _run_prediction(ticker, m, sc, gt, raw_dict)
+            sc   = art["scalers"]; gt = art["graph_tickers"]
+            cfg  = ckpt.get("base_config", BASE_CONFIG)
+            m    = build_model(len(gt), np.array(ckpt["adj_matrix"]), cfg)
+            m.load_state_dict(ckpt["model_state"]); m.eval()
+            raw_override = None
+            if ohlcv_points and len(ohlcv_points) >= 5:
+                provided_df = ohlcv_to_df(ohlcv_points)
+                raw_override = {ticker: provided_df}
+            result = _run_prediction(ticker, m, sc, gt, raw_override)
             result["metrics"] = reg[ticker].get("metrics")
             return result
 
-        # ── New stock: fine-tune ──────────────────────────────────
+        # ── New stock: fine-tune ──────────────────────────────
         DATA_START = "2019-01-01"
         DATA_END   = datetime.today().strftime("%Y-%m-%d")
         peers      = auto_peers(ticker, n=4)
         all_t      = [ticker] + peers
 
-        if ohlcv_points and len(ohlcv_points) > 60:
+        if ohlcv_points and len(ohlcv_points) >= 60:
             logging.info(f"  Using frontend OHLCV for {ticker} ({len(ohlcv_points)} points)")
             provided_df = ohlcv_to_df(ohlcv_points)
             peers_raw   = download_data(peers, DATA_START, DATA_END)
             raw         = {ticker: provided_df, **peers_raw}
+            if not peers_raw:
+                raw   = {ticker: provided_df}
+                peers = []
+                all_t = [ticker]
         else:
             raw = download_data(all_t, DATA_START, DATA_END)
 
@@ -565,10 +568,9 @@ if HEAVY_IMPORTS_OK:
             raise FileNotFoundError("Base model not found. Upload base_model.pt to the models/ directory.")
 
         ckpt     = torch.load(BASE_MODEL_PATH, map_location=DEVICE)
-        base_cfg = ckpt.get("base_config", {})
-        for k, v in BASE_CONFIG.items():
-            base_cfg.setdefault(k, v)
+        base_cfg = ckpt.get("base_config", BASE_CONFIG)
         base_n   = len(ckpt["base_tickers"])
+
         ft_model = build_model(base_n, np.array(ckpt["adj_matrix"]), base_cfg)
         ft_model.load_state_dict(ckpt["model_state"])
 
@@ -597,17 +599,13 @@ if HEAVY_IMPORTS_OK:
             "metrics":       te_m,
             "fine_tuned_on": datetime.now().isoformat(),
         }, mp)
-        joblib.dump({
-            "scalers":       scalers,
-            "feature_cols":  FEATURE_COLS,
-            "graph_tickers": graph_t,
-        }, sp)
+        joblib.dump({"scalers": scalers, "feature_cols": FEATURE_COLS,
+                     "graph_tickers": graph_t}, sp)
         register_stock(ticker, te_m, peers, mp)
 
         result = _run_prediction(ticker, ft_model, scalers, graph_t, raw)
         result["metrics"] = te_m
         return result
-
 
 # ─────────────────────────────────────────────────────────────
 #  Routes
@@ -616,7 +614,7 @@ if HEAVY_IMPORTS_OK:
 def health():
     return {
         "status": "ok",
-        "heavy_imports": HEAVY_IMPORTS_OK,
+        "heavy_imports": HEAVY_OK,
         "device": DEVICE,
         "base_model_exists": BASE_MODEL_PATH.exists(),
         "registered_stocks": list(load_registry().keys()),
@@ -628,14 +626,10 @@ def get_registry():
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
-    if not HEAVY_IMPORTS_OK:
+    if not HEAVY_OK:
         raise HTTPException(503, "ML libraries not installed.")
     try:
-        result = run_fine_tune(
-            req.ticker.upper().strip(),
-            req.force_retrain,
-            req.ohlcv,
-        )
+        result = run_fine_tune(req.ticker.upper().strip(), req.force_retrain, req.ohlcv)
         return result
     except FileNotFoundError as e:
         raise HTTPException(503, str(e))
