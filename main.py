@@ -153,28 +153,28 @@ if HEAVY_IMPORTS_OK:
 
     # ── Data download ──────────────────────────────────────────
     def download_data(tickers, start, end, verbose=True):
-    raw = {}
-    for t in tickers:
-        try:
-            ticker_obj = yf.Ticker(t)
-            ticker_obj.session = None
-            df = yf.download(
-                t,
-                start=start,
-                end=end,
-                progress=False,
-                auto_adjust=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                }
-            )
-            if len(df) > 60:
-                raw[t] = df
-                if verbose:
-                    logging.info(f"  Downloaded {t}: {len(df)} rows")
-        except Exception as e:
-            logging.warning(f"  Failed {t}: {e}")
-    return raw
+        raw = {}
+        for t in tickers:
+            try:
+                ticker_obj = yf.Ticker(t)
+                ticker_obj.session = None
+                df = yf.download(
+                    t,
+                    start=start,
+                    end=end,
+                    progress=False,
+                    auto_adjust=True,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    }
+                )
+                if len(df) > 60:
+                    raw[t] = df
+                    if verbose:
+                        logging.info(f"  Downloaded {t}: {len(df)} rows")
+            except Exception as e:
+                logging.warning(f"  Failed {t}: {e}")
+        return raw
 
     # ── Feature engineering ────────────────────────────────────
     def add_features(df):
