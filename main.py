@@ -6,36 +6,21 @@ Serves the TGT model predictions to the Vercel frontend.
 
 import os
 import json
-import math
 import time
 import warnings
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 warnings.filterwarnings("ignore")
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-import yfinance as yf
-yf.set_tz_cache_location("/tmp/yfinance_cache")
-
-# Patch yfinance session with browser headers
 import requests
-from requests.adapters import HTTPAdapter
 
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-})
-yf.base.requests = _session
-
-# ── Optional heavy imports (only needed when model is loaded) ──
+# ── Optional heavy imports ──
 try:
     import numpy as np
     import pandas as pd
@@ -45,6 +30,7 @@ try:
     from torch.utils.data import Dataset, DataLoader
     from sklearn.preprocessing import MinMaxScaler
     import yfinance as yf
+    yf.set_tz_cache_location("/tmp/yfinance_cache")
     import ta
     import joblib
     from scipy.stats import pearsonr
@@ -58,14 +44,9 @@ except ImportError as e:
 # ─────────────────────────────────────────────────────────────
 app = FastAPI(title="Stock Sensei AI", version="3.0.0")
 
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:3000,https://stock-sensei-ai-05.vercel.app"
-).split(",")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to ALLOWED_ORIGINS after confirming your Vercel URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,14 +55,22 @@ app.add_middleware(
 # ─────────────────────────────────────────────────────────────
 #  Paths & Config
 # ─────────────────────────────────────────────────────────────
-MODEL_DIR      = Path(os.getenv("MODEL_DIR", "./models"))
+MODEL_DIR       = Path(os.getenv("MODEL_DIR", "./models"))
 BASE_MODEL_PATH = MODEL_DIR / "base_model.pt"
-REGISTRY_PATH  = MODEL_DIR / "registry.json"
+REGISTRY_PATH   = MODEL_DIR / "registry.json"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# One-time copy of base_model.pt to persistent volume
+_src = Path("base_model.pt")
+if _src.exists() and not BASE_MODEL_PATH.exists():
+    import shutil
+    BASE_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_src, BASE_MODEL_PATH)
+    logging.info("Copied base_model.pt to volume.")
 
 DEVICE = "cuda" if (HEAVY_IMPORTS_OK and torch.cuda.is_available()) else "cpu"
 
-N_FEATURES = 18   # must match notebook
+N_FEATURES = 18
 SEQ_LEN    = 30
 
 BASE_CONFIG = {
@@ -104,9 +93,18 @@ FEATURE_COLS = [
 # ─────────────────────────────────────────────────────────────
 #  Pydantic Models
 # ─────────────────────────────────────────────────────────────
+class OHLCVPoint(BaseModel):
+    date: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
 class AnalyzeRequest(BaseModel):
     ticker: str
     force_retrain: bool = False
+    ohlcv: Optional[List[OHLCVPoint]] = None  # sent from frontend to skip Yahoo download
 
 class PredictionResult(BaseModel):
     ticker: str
@@ -147,33 +145,52 @@ def register_stock(ticker, metrics, peers, model_path):
     save_registry(reg)
 
 # ─────────────────────────────────────────────────────────────
-#  ML Utilities  (only executed when HEAVY_IMPORTS_OK)
+#  ML Utilities
 # ─────────────────────────────────────────────────────────────
 if HEAVY_IMPORTS_OK:
 
-    # ── Data download ──────────────────────────────────────────
+    # ── Convert frontend OHLCV list → DataFrame ────────────────
+    def ohlcv_to_df(ohlcv_points: List[OHLCVPoint]) -> pd.DataFrame:
+        records = [
+            {
+                "Date":   p.date,
+                "Open":   p.open,
+                "High":   p.high,
+                "Low":    p.low,
+                "Close":  p.close,
+                "Volume": p.volume,
+            }
+            for p in ohlcv_points
+        ]
+        df = pd.DataFrame(records)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        return df
+
+    # ── Data download (used for peers only when frontend sends OHLCV) ─
     def download_data(tickers, start, end, verbose=True):
         raw = {}
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
         for t in tickers:
-            try:
-                ticker_obj = yf.Ticker(t)
-                ticker_obj.session = None
-                df = yf.download(
-                    t,
-                    start=start,
-                    end=end,
-                    progress=False,
-                    auto_adjust=True,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    }
-                )
-                if len(df) > 60:
-                    raw[t] = df
-                    if verbose:
-                        logging.info(f"  Downloaded {t}: {len(df)} rows")
-            except Exception as e:
-                logging.warning(f"  Failed {t}: {e}")
+            for attempt in range(3):
+                try:
+                    yticker = yf.Ticker(t, session=session)
+                    df = yticker.history(start=start, end=end, auto_adjust=True)
+                    if df is not None and len(df) > 60:
+                        raw[t] = df
+                        if verbose:
+                            logging.info(f"  Downloaded {t}: {len(df)} rows")
+                        break
+                    else:
+                        time.sleep(2)
+                except Exception as e:
+                    logging.warning(f"  Attempt {attempt+1} failed for {t}: {e}")
+                    time.sleep(3)
         return raw
 
     # ── Feature engineering ────────────────────────────────────
@@ -294,16 +311,15 @@ if HEAVY_IMPORTS_OK:
             self.fc2 = nn.Linear(hidden, out_f)
             self.drop = nn.Dropout(dropout)
         def forward(self, x):
-            # x: (B, N, seq, F)
             B, N, S, F = x.shape
             a = self.adj.unsqueeze(0).expand(B, -1, -1)
-            h = x.mean(dim=2)              # (B, N, F)
-            h = torch.bmm(a, h)            # (B, N, F)
+            h = x.mean(dim=2)
+            h = torch.bmm(a, h)
             h = F.relu(self.fc1(h))
             h = self.drop(h)
             h = torch.bmm(a, h)
             h = self.fc2(h)
-            return h[:, 0, :]              # target node
+            return h[:, 0, :]
 
     class TGTModel(nn.Module):
         def __init__(self, n_nodes, adj, cfg):
@@ -329,14 +345,13 @@ if HEAVY_IMPORTS_OK:
             self.gcn.adj = torch.tensor(new_adj, dtype=torch.float32).to(DEVICE)
 
         def forward(self, x):
-            # x: (B, N, seq, F)
             B, N, S, F = x.shape
-            gcn_out = self.gcn(x)                         # (B, d)
-            gru_in  = x[:, 0, :, :]                       # (B, seq, F)
+            gcn_out = self.gcn(x)
+            gru_in  = x[:, 0, :, :]
             gru_out, _ = self.gru(gru_in)
-            gru_out = gru_out[:, -1, :]                   # (B, gru_hidden)
-            tr_in   = self.proj(gru_in)                   # (B, seq, tr_dim)
-            tr_out  = self.transformer(tr_in)[:, -1, :]   # (B, tr_dim)
+            gru_out = gru_out[:, -1, :]
+            tr_in   = self.proj(gru_in)
+            tr_out  = self.transformer(tr_in)[:, -1, :]
             w = F.softmax(self.alpha, dim=0)
             fused = w[0] * gcn_out + w[1] * gru_out + w[2] * tr_out
             return self.head(fused)
@@ -354,7 +369,7 @@ if HEAVY_IMPORTS_OK:
             filter(lambda p: p.requires_grad, model.parameters()),
             lr=cfg["lr"], weight_decay=cfg["weight_decay"],
         )
-        sched   = torch.optim.lr_scheduler.OneCycleLR(
+        sched = torch.optim.lr_scheduler.OneCycleLR(
             opt, max_lr=cfg["lr"], steps_per_epoch=len(tr_loader), epochs=cfg["epochs"],
         )
         loss_fn = nn.HuberLoss()
@@ -438,7 +453,6 @@ if HEAVY_IMPORTS_OK:
         for sector, peers in SECTOR_PEERS.items():
             if t in peers:
                 return [p for p in peers if p != t][:n]
-        # fallback
         if ".NS" in t or ".BO" in t:
             return ["TCS.NS","INFY.NS","HDFCBANK.NS","RELIANCE.NS"][:n]
         return ["AAPL","MSFT","GOOGL","AMZN"][:n]
@@ -455,14 +469,12 @@ if HEAVY_IMPORTS_OK:
         if df is None:
             raise ValueError(f"No data for {ticker}")
 
-        feat       = add_features(df)
-        close_sc   = scalers["__close__"]
-        target_sc  = scalers.get(ticker, scalers.get(list(scalers.keys())[0]))
-        raw_seq    = feat[FEATURE_COLS].values[-SEQ_LEN:]
+        feat      = add_features(df)
+        close_sc  = scalers["__close__"]
+        target_sc = scalers.get(ticker, scalers.get(list(scalers.keys())[0]))
+        raw_seq   = feat[FEATURE_COLS].values[-SEQ_LEN:]
         scaled_seq = target_sc.transform(raw_seq)
-        # build fake multi-node tensor using only target (simplification for inference)
         x = torch.tensor(scaled_seq, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(DEVICE)
-        # replicate for n_nodes
         n_nodes = model.gcn.adj.shape[0]
         x = x.expand(-1, n_nodes, -1, -1)
 
@@ -475,14 +487,12 @@ if HEAVY_IMPORTS_OK:
                 price_sc = out.cpu().numpy()[0, 0]
                 price    = float(close_sc.inverse_transform([[price_sc]])[0, 0])
                 prices.append(price)
-                # shift window
                 new_row = inp[:, :, -1:, :].clone()
                 new_row[:, 0, 0, 0] = out.squeeze()
                 inp = torch.cat([inp[:, :, 1:, :], new_row], dim=2)
 
         lc        = float(feat["Close"].iloc[-1])
         last_date = str(feat.index[-1].date())
-        _f        = lambda v: round(v, 4)
 
         future_dates = []
         d = datetime.strptime(last_date, "%Y-%m-%d")
@@ -496,43 +506,54 @@ if HEAVY_IMPORTS_OK:
         predictions = {dt: round(p, 2) for dt, p in zip(future_dates, prices)}
 
         return {
-            "ticker":          ticker,
-            "last_close":      round(lc, 2),
-            "last_date":       last_date,
+            "ticker":           ticker,
+            "last_close":       round(lc, 2),
+            "last_date":        last_date,
             "predicted_prices": [round(p, 2) for p in prices],
-            "predictions":     predictions,
-            "change_pct_day1": _f((prices[0] - lc) / (lc + 1e-8) * 100),
-            "trend":           "UPTREND" if prices[-1] > prices[0] else "DOWNTREND",
-            "signal":          "BUY" if prices[0] > lc else "SELL",
-            "peers_used":      graph_tickers[1:],
-            "generated_at":    datetime.now().isoformat(),
+            "predictions":      predictions,
+            "change_pct_day1":  round((prices[0] - lc) / (lc + 1e-8) * 100, 4),
+            "trend":            "UPTREND" if prices[-1] > prices[0] else "DOWNTREND",
+            "signal":           "BUY" if prices[0] > lc else "SELL",
+            "peers_used":       graph_tickers[1:],
+            "generated_at":     datetime.now().isoformat(),
         }
 
     # ── Fine-tune flow ─────────────────────────────────────────
-    def run_fine_tune(ticker: str, force_retrain: bool = False) -> dict:
+    def run_fine_tune(ticker: str, force_retrain: bool = False, ohlcv_points=None) -> dict:
         ticker = ticker.upper()
         mp = MODEL_DIR / f"{ticker.replace('.','_')}_model.pt"
         sp = MODEL_DIR / f"{ticker.replace('.','_')}_scalers.pkl"
 
         reg = load_registry()
+
+        # ── Already trained → quick predict ──────────────────────
         if ticker in reg and not force_retrain and mp.exists() and sp.exists():
-            # load and predict
             ckpt = torch.load(mp, map_location=DEVICE)
             art  = joblib.load(sp)
             sc   = art["scalers"]
             gt   = art["graph_tickers"]
             m    = build_model(len(gt), np.array(ckpt["adj_matrix"]), ckpt["base_config"])
             m.load_state_dict(ckpt["model_state"])
-            result = _run_prediction(ticker, m, sc, gt)
+            raw_dict = {ticker: ohlcv_to_df(ohlcv_points)} if ohlcv_points else None
+            result = _run_prediction(ticker, m, sc, gt, raw_dict)
             result["metrics"] = reg[ticker].get("metrics")
             return result
 
+        # ── New stock: fine-tune ──────────────────────────────────
         DATA_START = "2019-01-01"
         DATA_END   = datetime.today().strftime("%Y-%m-%d")
         peers      = auto_peers(ticker, n=4)
         all_t      = [ticker] + peers
-        raw        = download_data(all_t, DATA_START, DATA_END)
-        avail      = [t for t in all_t if t in raw]
+
+        if ohlcv_points and len(ohlcv_points) > 60:
+            logging.info(f"  Using frontend OHLCV for {ticker} ({len(ohlcv_points)} points)")
+            provided_df = ohlcv_to_df(ohlcv_points)
+            peers_raw   = download_data(peers, DATA_START, DATA_END)
+            raw         = {ticker: provided_df, **peers_raw}
+        else:
+            raw = download_data(all_t, DATA_START, DATA_END)
+
+        avail = [t for t in all_t if t in raw]
         if ticker not in raw:
             raise ValueError(f"Cannot download data for {ticker}. Check the ticker symbol.")
 
@@ -541,10 +562,7 @@ if HEAVY_IMPORTS_OK:
         tr_l, va_l, te_l, ntr, nva, nte = make_loaders(scaled, graph_t, ticker, FINETUNE_CONFIG)
 
         if not BASE_MODEL_PATH.exists():
-            raise FileNotFoundError(
-                "Base model not found. Run Phase 1 training in the notebook first, "
-                "then upload base_model.pt to the models/ directory."
-            )
+            raise FileNotFoundError("Base model not found. Upload base_model.pt to the models/ directory.")
 
         ckpt     = torch.load(BASE_MODEL_PATH, map_location=DEVICE)
         base_cfg = ckpt["base_config"]
@@ -568,18 +586,18 @@ if HEAVY_IMPORTS_OK:
         te_m                  = compute_metrics(te_ti, te_pi)
 
         torch.save({
-            "model_state":  ft_model.state_dict(),
-            "base_config":  base_cfg,
+            "model_state":   ft_model.state_dict(),
+            "base_config":   base_cfg,
             "graph_tickers": graph_t,
-            "adj_matrix":   adj.tolist(),
-            "ticker":       ticker,
-            "peers":        peers,
-            "metrics":      te_m,
+            "adj_matrix":    adj.tolist(),
+            "ticker":        ticker,
+            "peers":         peers,
+            "metrics":       te_m,
             "fine_tuned_on": datetime.now().isoformat(),
         }, mp)
         joblib.dump({
-            "scalers": scalers,
-            "feature_cols": FEATURE_COLS,
+            "scalers":       scalers,
+            "feature_cols":  FEATURE_COLS,
             "graph_tickers": graph_t,
         }, sp)
         register_stock(ticker, te_m, peers, mp)
@@ -609,9 +627,13 @@ def get_registry():
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     if not HEAVY_IMPORTS_OK:
-        raise HTTPException(503, "ML libraries not installed. Run: pip install -r requirements.txt")
+        raise HTTPException(503, "ML libraries not installed.")
     try:
-        result = run_fine_tune(req.ticker.upper().strip(), req.force_retrain)
+        result = run_fine_tune(
+            req.ticker.upper().strip(),
+            req.force_retrain,
+            req.ohlcv,
+        )
         return result
     except FileNotFoundError as e:
         raise HTTPException(503, str(e))
@@ -623,5 +645,4 @@ def analyze(req: AnalyzeRequest):
 
 @app.get("/predict/{ticker}")
 def predict(ticker: str, force_retrain: bool = False):
-    """GET convenience endpoint — same as POST /analyze"""
     return analyze(AnalyzeRequest(ticker=ticker, force_retrain=force_retrain))
